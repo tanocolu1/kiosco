@@ -1,7 +1,5 @@
 {
-  "build": {
-    "builder": "NIXPACKS"
-  },
+  "build": { "builder": "NIXPACKS" },
   "deploy": {
     "startCommand": "uvicorn app.main:APP --host 0.0.0.0 --port $PORT"
   }

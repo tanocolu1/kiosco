@@ -1,258 +1,256 @@
 import os
 import re
-from urllib.parse import urlparse, unquote
+from typing import Any, Dict, Optional, Tuple
+from urllib.parse import urlparse, parse_qs
 
 import httpx
-from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, HttpUrl
+from pydantic import BaseModel
 
-load_dotenv()
 
-APP = FastAPI(title="TiendaColucci Price Kiosk Resolver")
+APP = FastAPI(title="Kiosco Precios VTEX", version="1.0.0")
 
-# ===== Fixed store config =====
-STORE_DOMAIN = "www.tiendacolucci.com.ar"
-SALES_CHANNEL = "1"
 
-# ===== VTEX credentials (must be set in Railway Variables) =====
-VTEX_ACCOUNT = os.getenv("VTEX_ACCOUNT", "").strip()
-VTEX_APP_KEY = os.getenv("VTEX_APP_KEY", "").strip()
-VTEX_APP_TOKEN = os.getenv("VTEX_APP_TOKEN", "").strip()
-DEFAULT_SELLER = os.getenv("DEFAULT_SELLER", "1").strip()
+# ============
+# ENV CONFIG
+# ============
+VTEX_ACCOUNT = os.getenv("VTEX_ACCOUNT")  # ej: "tiendacolucci"
+VTEX_APP_KEY = os.getenv("VTEX_APP_KEY")
+VTEX_APP_TOKEN = os.getenv("VTEX_APP_TOKEN")
+
+STORE_DOMAIN = os.getenv("STORE_DOMAIN", "www.tiendacolucci.com.ar")
+SALES_CHANNEL = os.getenv("SALES_CHANNEL", "1")  # sc=1
 
 if not VTEX_ACCOUNT or not VTEX_APP_KEY or not VTEX_APP_TOKEN:
-    raise RuntimeError(
-        "Missing VTEX_ACCOUNT / VTEX_APP_KEY / VTEX_APP_TOKEN environment variables"
-    )
+    raise RuntimeError("Missing VTEX_ACCOUNT / VTEX_APP_KEY / VTEX_APP_TOKEN environment variables")
+
 
 VTEX_BASE = f"https://{VTEX_ACCOUNT}.vtexcommercestable.com.br"
 
-# ===== CORS (frontend PWA calls backend) =====
-APP.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # en prod podés restringir al dominio del frontend
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
-
-class ResolveReq(BaseModel):
-    url: HttpUrl
-
-
-class ResolveResp(BaseModel):
-    ok: bool
+class ResolveIn(BaseModel):
     url: str
-    slug: str
-    productName: str | None = None
-    skuId: str | None = None
-    seller: str | None = None
-    imageUrl: str | None = None
-
-    # prices in cents
-    price: int | None = None
-    listPrice: int | None = None
-    sellingPrice: int | None = None
-
-    currency: str = "ARS"
-    source: str
 
 
-def extract_slug_from_url(raw_url: str) -> str:
+# =========================
+# Helpers: URL -> SKU ID
+# =========================
+def extract_sku_id_from_url(raw_url: str) -> Optional[int]:
     """
-    VTEX PDP típico:
-      https://www.tiendacolucci.com.ar/<slug>/p
-    Tomamos el primer segmento del path como slug.
+    Intenta sacar skuId/itemId/ITEM_ID desde:
+      - query params: skuId, skuid, itemId, item_id, ITEM_ID
+      - path: .../sku/12345...  (por si lo usan así)
     """
-    parsed = urlparse(raw_url)
-    host = (parsed.hostname or "").lower()
+    try:
+        u = urlparse(raw_url)
+    except Exception:
+        return None
 
-    if host != STORE_DOMAIN:
-        raise HTTPException(status_code=400, detail="URL domain not allowed")
+    qs = parse_qs(u.query or "")
 
-    path = unquote(parsed.path or "").strip("/")
-    if not path:
-        raise HTTPException(status_code=400, detail="URL path is empty")
+    # Preferencias típicas
+    candidates = [
+        "skuId",
+        "skuid",
+        "itemId",
+        "item_id",
+        "ITEM_ID",
+        "SkuId",
+        "ItemId",
+    ]
+    for k in candidates:
+        if k in qs and qs[k]:
+            v = qs[k][0]
+            if v and str(v).isdigit():
+                return int(v)
 
-    first = path.split("/")[0].strip()
-    slug = re.sub(r"[^a-zA-Z0-9\-_.]", "", first).strip().lower()
+    # fallback: buscar número grande en path con patrón
+    m = re.search(r"(?:sku|skuid|item|itemid|item_id)[=/\-](\d+)", (u.path or "") + "?" + (u.query or ""), re.IGNORECASE)
+    if m:
+        return int(m.group(1))
 
-    if not slug:
-        raise HTTPException(status_code=400, detail="Could not extract slug from URL")
-
-    return slug
+    return None
 
 
-async def vtex_search_by_slug(slug: str) -> dict:
+def validate_domain(raw_url: str) -> None:
     """
-    Search API público del store:
-      1) /api/catalog_system/pub/products/search/{slug}/p
-      2) fallback /api/catalog_system/pub/products/search?ft=
+    Valida que el QR apunte a tu dominio (o subdominio).
     """
-    url1 = f"https://{STORE_DOMAIN}/api/catalog_system/pub/products/search/{slug}/p"
-    params1 = {"sc": SALES_CHANNEL}
+    try:
+        u = urlparse(raw_url)
+    except Exception:
+        raise HTTPException(status_code=400, detail="URL inválida")
 
-    async with httpx.AsyncClient(timeout=10) as client:
-        r1 = await client.get(url1, params=params1)
-        if r1.status_code == 200:
-            data = r1.json()
-            if isinstance(data, list) and len(data) > 0:
-                return data[0]
+    host = (u.netloc or "").lower()
+    if not host:
+        raise HTTPException(status_code=400, detail="URL sin dominio")
 
-        url2 = f"https://{STORE_DOMAIN}/api/catalog_system/pub/products/search"
-        params2 = {"ft": slug, "sc": SALES_CHANNEL}
-        r2 = await client.get(url2, params=params2)
+    # Acepta el dominio exacto o subdominios
+    if host == STORE_DOMAIN.lower() or host.endswith("." + STORE_DOMAIN.lower()):
+        return
 
-        if r2.status_code != 200:
-            raise HTTPException(status_code=502, detail="VTEX search failed")
-
-        data2 = r2.json()
-        if not isinstance(data2, list) or len(data2) == 0:
-            raise HTTPException(status_code=404, detail="Product not found by slug")
-
-        # mejor match por linkText si existe
-        for p in data2:
-            if (p.get("linkText") or "").lower() == slug:
-                return p
-
-        return data2[0]
+    raise HTTPException(status_code=400, detail="Dominio no permitido")
 
 
-def pick_sku(product: dict) -> tuple[str, str, str | None, dict]:
-    """
-    Elige el primer SKU. También extrae precio de catálogo (commertialOffer)
-    para fallback si simulation falla.
-    """
-    items = product.get("items") or []
-    if not items:
-        raise HTTPException(status_code=404, detail="No SKUs in product")
-
-    item = items[0]
-    sku_id = str(item.get("itemId") or item.get("id") or "")
-    if not sku_id:
-        raise HTTPException(status_code=404, detail="Could not find skuId in product")
-
-    seller = DEFAULT_SELLER
-    image_url = None
-    offer_prices: dict = {}
-
-    sellers = item.get("sellers") or []
-    if sellers:
-        s0 = sellers[0]
-        if s0.get("sellerId"):
-            seller = str(s0["sellerId"])
-
-        comm = s0.get("commertialOffer") or {}
-        # VTEX suele devolver valores en ARS como float, no en centavos
-        offer_prices = {
-            "Price": comm.get("Price"),
-            "ListPrice": comm.get("ListPrice"),
-        }
-
-    images = item.get("images") or []
-    if images and images[0].get("imageUrl"):
-        image_url = images[0]["imageUrl"]
-
-    return sku_id, seller, image_url, offer_prices
-
-
-async def vtex_simulate_price(sku_id: str, seller: str) -> dict:
-    """
-    Checkout Simulation para precio final (con promos/reglas).
-    Si falla, devolvemos un error con detalle (para debug).
-    """
-    endpoint = f"{VTEX_BASE}/api/checkout/pub/orderForms/simulation"
-    params = {"sc": SALES_CHANNEL}
-    headers = {
-        "Accept": "application/json",
-        "Content-Type": "application/json",
+def vtex_headers() -> Dict[str, str]:
+    # VTEX autentica con AppKey/AppToken en headers :contentReference[oaicite:1]{index=1}
+    return {
         "X-VTEX-API-AppKey": VTEX_APP_KEY,
         "X-VTEX-API-AppToken": VTEX_APP_TOKEN,
     }
 
-    body = {
-        "items": [{"id": str(sku_id), "quantity": 1, "seller": str(seller)}],
-        # OJO: a veces country rompe según configuración de cuenta.
-        # "country": "ARG",
+
+# =========================
+# VTEX calls
+# =========================
+async def get_sku_basic(client: httpx.AsyncClient, sku_id: int) -> Dict[str, Any]:
+    """
+    Trae info básica del SKU (privado), útil para:
+      - product name
+      - productId
+      - si está activo
+    """
+    url = f"{VTEX_BASE}/api/catalog_system/pvt/sku/stockkeepingunitbyid/{sku_id}"
+    r = await client.get(url, headers=vtex_headers(), timeout=20)
+    if r.status_code == 404:
+        raise HTTPException(status_code=404, detail="SKU no existe")
+    r.raise_for_status()
+    return r.json()
+
+
+async def get_pricing_price_any_visibility(client: httpx.AsyncClient, sku_id: int, sc: str) -> Dict[str, Any]:
+    """
+    Pricing API (privada): devuelve precio aunque no esté publicado / sin stock.
+    Endpoint típico: /api/pricing/prices/{itemId}
+    """
+    url = f"{VTEX_BASE}/api/pricing/prices/{sku_id}"
+    r = await client.get(url, headers=vtex_headers(), timeout=20)
+    if r.status_code == 404:
+        raise HTTPException(status_code=404, detail="SKU sin precio configurado")
+    r.raise_for_status()
+    data = r.json()
+
+    # data suele tener basePrice y fixedPrices (por tradePolicyId)
+    # Buscamos fixedPrices para el sales channel (sc) si existe:
+    fixed = None
+    fixed_list = data.get("fixedPrices") or data.get("FixedPrices") or []
+    for fp in fixed_list:
+        # tradePolicyId suele venir como string
+        tpid = fp.get("tradePolicyId") or fp.get("TradePolicyId")
+        if tpid is not None and str(tpid) == str(sc):
+            fixed = fp
+            break
+
+    # Elegimos precio "selling" como fixedPrice.value si existe, si no basePrice
+    base_price = data.get("basePrice") or data.get("BasePrice")
+    list_price = data.get("listPrice") or data.get("ListPrice")  # a veces no está
+
+    selling = None
+    if fixed is not None:
+        selling = fixed.get("value") or fixed.get("Value")
+        # en fixedPrices a veces también viene listPrice
+        list_price = fixed.get("listPrice") or fixed.get("ListPrice") or list_price
+
+    if selling is None:
+        selling = base_price
+
+    if selling is None:
+        raise HTTPException(status_code=404, detail="SKU sin precio configurado")
+
+    return {
+        "selling": float(selling),
+        "list": float(list_price) if list_price is not None else None,
+        "raw": data,
     }
 
-    async with httpx.AsyncClient(timeout=15) as client:
-        r = await client.post(endpoint, params=params, headers=headers, json=body)
 
-        if r.status_code != 200:
-            detail = (r.text or "").strip()
-            raise HTTPException(
-                status_code=502,
-                detail=f"VTEX simulation failed ({r.status_code}): {detail}",
-            )
-
+async def get_stock_quantity_if_possible(client: httpx.AsyncClient, sku_id: int) -> Tuple[Optional[int], Optional[bool]]:
+    """
+    Intenta obtener stock (privado) sin afectar precio.
+    Si falla, devuelve (None, None).
+    """
+    try:
+        # Endpoint común de inventory: /api/logistics/pvt/inventory/skus/{skuId}
+        # (si no tenés permisos, puede dar 403)
+        url = f"{VTEX_BASE}/api/logistics/pvt/inventory/skus/{sku_id}"
+        r = await client.get(url, headers=vtex_headers(), timeout=20)
+        if r.status_code in (403, 404):
+            return None, None
+        r.raise_for_status()
         data = r.json()
-        items = data.get("items") or []
-        if not items:
-            raise HTTPException(status_code=502, detail="VTEX simulation returned no items")
 
-        it = items[0]
-        return {
-            "price": it.get("price"),
-            "listPrice": it.get("listPrice"),
-            "sellingPrice": it.get("sellingPrice"),
-        }
+        # Estructuras típicas: balance por warehouse
+        # Sumamos totalQuantity (si existe) o reserved/available (según tienda)
+        total = 0
+        found_any = False
 
+        balances = data.get("balance") or data.get("Balance") or []
+        if isinstance(balances, list):
+            for b in balances:
+                # algunas tiendas: totalQuantity / availableQuantity
+                tq = b.get("totalQuantity")
+                aq = b.get("availableQuantity")
+                if tq is not None:
+                    total += int(tq)
+                    found_any = True
+                elif aq is not None:
+                    total += int(aq)
+                    found_any = True
 
-def to_cents(v) -> int | None:
-    if v is None:
-        return None
-    try:
-        return int(round(float(v) * 100))
+        if not found_any:
+            return None, None
+
+        return total, total > 0
     except Exception:
-        return None
+        return None, None
 
 
+# =========================
+# Routes
+# =========================
 @APP.get("/health")
-def health():
-    return {"ok": True, "domain": STORE_DOMAIN, "sc": SALES_CHANNEL}
+async def health():
+    return {"ok": True, "domain": STORE_DOMAIN, "sc": str(SALES_CHANNEL)}
 
 
-@APP.post("/resolve", response_model=ResolveResp)
-async def resolve(req: ResolveReq):
-    slug = extract_slug_from_url(str(req.url))
+@APP.post("/resolve")
+async def resolve(payload: ResolveIn):
+    validate_domain(payload.url)
 
-    product = await vtex_search_by_slug(slug)
-    product_name = product.get("productName") or None
+    sku_id = extract_sku_id_from_url(payload.url)
+    if not sku_id:
+        raise HTTPException(
+            status_code=400,
+            detail="No pude detectar el SKU/ITEM_ID en la URL del QR. Usá un QR que incluya ?ITEM_ID=12345 (o skuId=12345).",
+        )
 
-    sku_id, seller, image_url, offer_prices = pick_sku(product)
+    async with httpx.AsyncClient() as client:
+        sku = await get_sku_basic(client, sku_id)
 
-    # 1) Intentamos simulation (promos)
-    # 2) Si falla (tu caso), fallback a catálogo (commertialOffer)
-    try:
-        prices = await vtex_simulate_price(sku_id, seller)
-        source = "search+simulation"
-    except HTTPException as e:
-        # fallback SOLO si falló simulation; si fue otra cosa, re-raise
-        msg = str(e.detail or "")
-        if "VTEX simulation failed" in msg or "VTEX simulation returned no items" in msg:
-            prices = {
-                "price": to_cents(offer_prices.get("Price")),
-                "sellingPrice": to_cents(offer_prices.get("Price")),
-                "listPrice": to_cents(offer_prices.get("ListPrice")),
-            }
-            source = "search+catalog_offer_fallback"
-        else:
-            raise
+        # Nombre “humano” (fallbacks)
+        product_name = (
+            sku.get("NameComplete")
+            or sku.get("Name")
+            or sku.get("name")
+            or sku.get("nameComplete")
+            or f"SKU {sku_id}"
+        )
 
-    return ResolveResp(
-        ok=True,
-        url=str(req.url),
-        slug=slug,
-        productName=product_name,
-        skuId=sku_id,
-        seller=seller,
-        imageUrl=image_url,
-        price=prices.get("price"),
-        listPrice=prices.get("listPrice"),
-        sellingPrice=prices.get("sellingPrice"),
-        source=source,
-    )
+        pricing = await get_pricing_price_any_visibility(client, sku_id, sc=str(SALES_CHANNEL))
+
+        # Intentamos stock (si no hay permisos o no aplica, no rompe)
+        qty, in_stock = await get_stock_quantity_if_possible(client, sku_id)
+
+        # Front trabaja en centavos
+        selling_cents = int(round(pricing["selling"] * 100))
+        list_cents = int(round(pricing["list"] * 100)) if pricing["list"] is not None else None
+
+        return {
+            "skuId": sku_id,
+            "productName": product_name,
+            "sellingPrice": selling_cents,
+            "listPrice": list_cents,
+            "availableQuantity": qty,   # puede ser None
+            "inStock": in_stock,        # puede ser None
+            "source": "pricing_api",
+        }
